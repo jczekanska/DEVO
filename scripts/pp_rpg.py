@@ -6,7 +6,10 @@ import tqdm
 import glob
 import multiprocessing
 
-import rosbag
+# import rosbag
+from pathlib import Path
+from rosbags.highlevel import AnyReader
+
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import tqdm as tqdm
@@ -57,12 +60,137 @@ def get_calib_rpg(H, W, side, bag, imtopic):
 
 
 def process_dirs(indirs, side="left", DELTA_MS=None):
-    for indir in indirs: 
+
+
+    class _BagCompat:
+        def __init__(self, path):
+            self._path = Path(path)
+            self._counts = {}
+            self._topics = {}
+            self._load_topics()
+
+        def _load_topics(self):
+            with AnyReader([self._path]) as reader:
+                for c in reader.connections:
+                    self._topics[c.topic] = c
+                    self._counts[c.topic] = 0
+                for c, ts, data in reader.messages():
+                    self._counts[c.topic] = self._counts.get(c.topic, 0) + 1
+
+        def get_type_and_topic_info(self):
+            return None, self._topics
+
+        def get_message_count(self, topic):
+            return self._counts.get(topic, 0)
+
+        def read_messages(self, topics):
+            if isinstance(topics, (list, tuple)):
+                topics = set(topics)
+            else:
+                topics = {topics}
+
+            with AnyReader([self._path]) as reader:
+                for c, ts, data in reader.messages():
+                    if c.topic not in topics:
+                        continue
+
+                    msg = reader.deserialize(data, c.msgtype)
+
+                    ts_val_ns = ts
+                    if hasattr(ts, "sec") and hasattr(ts, "nanosec"):
+                        try:
+                            ts_val_ns = int(ts.sec) * 1_000_000_000 + int(ts.nanosec)
+                        except Exception:
+                            ts_val_ns = ts
+                    elif isinstance(ts, (tuple, list)) and len(ts) >= 2:
+                        try:
+                            ts_val_ns = int(ts[0]) * 1_000_000_000 + int(ts[1])
+                        except Exception:
+                            pass
+                    if hasattr(msg, "events"):
+                        for ev in msg.events:
+                            ev_ts = getattr(ev, "ts", None)
+                            if ev_ts is None:
+                                continue
+                            if not hasattr(ev_ts, "to_nsec"):
+                                if hasattr(ev_ts, "sec") and hasattr(ev_ts, "nanosec"):
+                                    class _Stamp:
+                                        def __init__(self, sec, nanosec):
+                                            self.sec = int(sec)
+                                            self.nanosec = int(nanosec)
+                                        def to_nsec(self):
+                                            return self.sec * 1_000_000_000 + self.nanosec
+                                    ev.ts = _Stamp(ev_ts.sec, ev_ts.nanosec)
+                                elif isinstance(ev_ts, (int, float)):
+                                    class _StampConst:
+                                        def __init__(self, v):
+                                            self._v = int(v)
+                                        def to_nsec(self):
+                                            return self._v
+                                    ev.ts = _StampConst(ev_ts)
+
+                    if hasattr(msg, "header") and hasattr(msg.header, "stamp"):
+                        stamp = msg.header.stamp
+                        if not hasattr(stamp, "to_nsec") and hasattr(stamp, "sec") and hasattr(stamp, "nanosec"):
+                            class _StampH:
+                                def __init__(self, sec, nanosec):
+                                    self.sec = int(sec)
+                                    self.nanosec = int(nanosec)
+                                def to_nsec(self):
+                                    return self.sec * 1_000_000_000 + self.nanosec
+                            class _Header:
+                                def __init__(self, header):
+                                    self.stamp = _StampH(header.stamp.sec, header.stamp.nanosec)
+                                    self.frame_id = getattr(header, "frame_id", "")
+                            msg.header = _Header(msg.header)
+
+                    if hasattr(msg, "data") and hasattr(msg, "height") and hasattr(msg, "width"):
+                        raw = msg.data
+                        if not isinstance(raw, (list, tuple)):
+                            raw = list(raw)
+                        data_str = ", ".join(str(v) for v in raw)
+
+                        class _ImageStr:
+                            def __init__(self, msg, data_str):
+                                self._msg = msg
+                                self._data_str = data_str
+                            def __getattr__(self, name):
+                                return getattr(self._msg, name)
+                            def __str__(self):
+                                return (
+                                    f"header:\n"
+                                    f"  stamp:\n"
+                                    f"    secs: 0\n"
+                                    f"    nsecs: 0\n"
+                                    f"  frame_id: ''\n"
+                                    f"height: {self._msg.height}\n"
+                                    f"width: {self._msg.width}\n"
+                                    f"encoding: {self._msg.encoding}\n"
+                                    f"is_bigendian: {self._msg.is_bigendian}\n"
+                                    f"step: {self._msg.step}\n"
+                                    f"data: [{self._data_str}]"
+                                )
+
+                        msg = _ImageStr(msg, data_str)
+
+                    if not hasattr(msg, "_type"):
+                        try:
+                            msg._type = c.msgtype.replace("/msg/", "/")
+                        except Exception:
+                            msg._type = c.msgtype
+
+                    try:
+                        ts_us = float(ts_val_ns) / 1e3
+                    except Exception:
+                        ts_us = ts_val_ns
+                    yield c.topic, msg, ts_us
+
+    for indir in indirs:
         seq = indir.split("/")[-1]
         print(f"\n\n RPG: Undistorting {seq} evs & rgb")
 
         inbag = os.path.join(indir, f"../{seq}.bag")
-        bag = rosbag.Bag(inbag, "r")
+        bag = _BagCompat(inbag)
         topics = list(bag.get_type_and_topic_info()[1].keys())
         topics = sorted([t for t in topics if "events" in t or "image" in t])
         assert topics == sorted(['/davis_left/events', '/davis_left/image_raw', '/davis_right/events', '/davis_right/image_raw']) or topics == sorted(['/davis/left/events', '/davis/left/image_raw', '/davis/right/events', '/davis/right/image_raw'])
@@ -170,8 +298,29 @@ def process_dirs(indirs, side="left", DELTA_MS=None):
 
         tss_imgs_us = read_tss_us_from_rosbag(bag, topics[imgtopic_idx])
         assert len(tss_imgs_us) == len(imgs)
+
+        try:
+            t0_evs = read_t0us_evs_from_rosbag(bag, topics[evtopic_idx])
+        except Exception:
+            t0_evs = None
+            for topic, msg, t in bag.read_messages(topics[evtopic_idx]):
+                if hasattr(msg, "events"):
+                    for ev in msg.events:
+                        if hasattr(ev.ts, "to_nsec"):
+                            t0_evs = ev.ts.to_nsec() / 1e3
+                            break
+                        elif hasattr(ev.ts, "sec") and hasattr(ev.ts, "nanosec"):
+                            t0_evs = (int(ev.ts.sec) * 1_000_000_000 + int(ev.ts.nanosec)) / 1e3
+                            break
+                        elif isinstance(ev.ts, (int, float)):
+                            t0_evs = ev.ts / 1e3
+                            break
+                if t0_evs is not None:
+                    break
+            if t0_evs is None:
+                raise RuntimeError(f"No events found on topic {topics[evtopic_idx]} to determine t0_evs")
+
         poses, tss_gt_us = read_poses_from_rosbag(bag, posetopic, T_marker_cam0, T_cam0_cam1=T_cam0_cam1)
-        t0_evs = read_t0us_evs_from_rosbag(bag, topics[evtopic_idx])
         assert sorted(tss_imgs_us) == tss_imgs_us
         assert sorted(tss_gt_us) == tss_gt_us
 
@@ -233,6 +382,7 @@ def process_dirs(indirs, side="left", DELTA_MS=None):
   
     
 if __name__ == "__main__":
+    multiprocessing.set_start_method('fork', force=True)
     parser = argparse.ArgumentParser(description="PP ECD data in dir")
     parser.add_argument(
         "--indir", help="Input image directory.", default=""

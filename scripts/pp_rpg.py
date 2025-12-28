@@ -1,5 +1,6 @@
 import numpy as np
-import os
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import argparse
 import cv2
 import tqdm
@@ -26,6 +27,38 @@ def write_gt_stamped(poses, tss_us_gt, outfile):
                 else:
                     f.write(f"{p}")
             f.write("\n")
+
+
+def _compute_velocities_from_poses(poses, tss_us):
+    """
+    poses: list or (N,7) array with columns [tx ty tz qx qy qz qw] (or similar)
+    tss_us: list/array of timestamps in microseconds
+    returns: (times_s, v) where v shape (N,3) velocities aligned to each pose timestamp
+    uses central difference for interior points, forward/backward for endpoints
+    """
+    poses = np.asarray(poses, dtype=float)
+    tss_us = np.asarray(tss_us, dtype=float)
+    if poses.ndim != 2 or poses.shape[1] < 3:
+        raise ValueError("poses must be Nx>=3 array with positions in first 3 cols")
+    pos = poses[:, :3]
+    N = pos.shape[0]
+    times_s = tss_us / 1e6
+    v = np.zeros_like(pos)
+    if N == 1:
+        return times_s, v
+    
+    for i in range(1, N-1):
+        dt = times_s[i+1] - times_s[i-1]
+        if dt == 0:
+            v[i] = np.zeros(3)
+        else:
+            v[i] = (pos[i+1] - pos[i-1]) / dt
+
+    dt0 = times_s[1] - times_s[0]
+    v[0] = (pos[1] - pos[0]) / (dt0 if dt0 != 0 else 1.0)
+    dtN = times_s[-1] - times_s[-2]
+    v[-1] = (pos[-1] - pos[-2]) / (dtN if dtN != 0 else 1.0)
+    return times_s, v
 
 
 def get_calib_rpg(H, W, side, bag, imtopic):
@@ -60,8 +93,6 @@ def get_calib_rpg(H, W, side, bag, imtopic):
 
 
 def process_dirs(indirs, side="left", DELTA_MS=None):
-
-
     class _BagCompat:
         def __init__(self, path):
             self._path = Path(path)
@@ -107,6 +138,7 @@ def process_dirs(indirs, side="left", DELTA_MS=None):
                             ts_val_ns = int(ts[0]) * 1_000_000_000 + int(ts[1])
                         except Exception:
                             pass
+
                     if hasattr(msg, "events"):
                         for ev in msg.events:
                             ev_ts = getattr(ev, "ts", None)
@@ -335,6 +367,17 @@ def process_dirs(indirs, side="left", DELTA_MS=None):
 
         tss_gt_us = [t - t0_us for t in tss_gt_us]
         write_gt_stamped(poses, tss_gt_us, os.path.join(indir, f"gt_stamped_{side}.txt"))
+
+        # gt velocities
+        try:
+            times_s, vel = _compute_velocities_from_poses(np.array(poses), np.array(tss_gt_us))
+            out_vel = os.path.join(indir, f"gt_vel_{side}.txt")
+            with open(out_vel, 'w') as fv:
+                fv.write("# time[s] vx vy vz (central-diff, endpoints forward/backward)\n")
+                for t, vv in zip(times_s, vel):
+                    fv.write(f"{t:.9f} {vv[0]:.9e} {vv[1]:.9e} {vv[2]:.9e}\n")
+        except Exception as e:
+            print("Warning: failed to compute/save gt velocities:", e)
 
         # TODO: write events (and also substract t0_evs)
         evs = read_evs_from_rosbag(bag, topics[evtopic_idx], H=H, W=W)

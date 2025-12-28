@@ -152,7 +152,7 @@ runs
 cache
 *.out
 *.o
-*.zip
+*.zip*
 data
 figures/*.pdf
 

@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib
 matplotlib.use(os.environ.get("MPLBACKEND","Agg"))
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
 
 from utils.load_utils import load_gt_us, rpg_evs_iterator
 from utils.eval_utils import assert_eval_config, run_voxel
@@ -86,6 +87,44 @@ def _interp_to_times(src_times, src_vals, tgt_times):
         out[:, d] = np.interp(tgt_times, src_times, src_vals[:, d])
     return out
 
+def umeyama_align(A, B, need_scale=True):
+    assert A.shape == B.shape and A.shape[1] == 3
+    N = A.shape[0]
+    mu_A = A.mean(axis=0)
+    mu_B = B.mean(axis=0)
+    X = A - mu_A
+    Y = B - mu_B
+    cov = (Y.T @ X) / float(N)
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    Rm = U @ S @ Vt
+    varA = (X**2).sum() / float(N)
+    if need_scale:
+        s = np.trace(np.diag(D) @ S) / varA
+    else:
+        s = 1.0
+    t = mu_B - s * Rm @ mu_A
+    return s, Rm, t
+
+def apply_sim3(pts, s, Rm, t):
+    return (s * (pts @ Rm.T) + t)
+
+def estimate_time_offset_scalar(a, b, dt, max_offset_s=0.5):
+    a = a - np.mean(a)
+    b = b - np.mean(b)
+    N = len(a)
+    if N < 3:
+        return 0.0
+    maxlags = min(N-1, int(max_offset_s / (dt + 1e-12)))
+    corr = np.correlate(b, a, mode='full')
+    lags = np.arange(-N+1, N)
+    mask = (lags >= -maxlags) & (lags <= maxlags)
+    sub = corr[mask]
+    sel = np.argmax(sub)
+    lag = lags[mask][sel]
+    return lag * dt
 
 @torch.no_grad()
 def evaluate(config, args, net, train_step=None, datapath="", split_file=None,
@@ -159,47 +198,89 @@ def evaluate(config, args, net, train_step=None, datapath="", split_file=None,
                     est_times, est_pos = _read_stamped_traj(stamped_est)
                     gt_times, gt_pos = _read_stamped_traj(stamped_gt)
 
-                    # compute velocities (central differences) for estimator and gt (on their own timestamps)
-                    est_times_s, est_vel = _compute_vel_central(est_times, est_pos)
+                    # --- sim(3) alignment (umeyama) using close timestamp correspondences ---
+                    est_pos_aligned = est_pos.copy()
+                    s_val = 1.0
+                    
+                    max_match_dt = 0.02
+                    matches_est = []
+                    matches_gt = []
+                    for ie, te in enumerate(est_times):
+                        j = np.argmin(np.abs(gt_times - te))
+                        if abs(gt_times[j] - te) <= max_match_dt:
+                            matches_est.append(ie)
+                            matches_gt.append(j)
+                    if len(matches_est) >= 6:
+                        A = est_pos[np.array(matches_est)]
+                        B = gt_pos[np.array(matches_gt)]
+                        s_val, Rm, tvec = umeyama_align(A, B, need_scale=True)
+                        est_pos_aligned = apply_sim3(est_pos, s_val, Rm, tvec)
+                        print(f"[Umeyama] applied scale={s_val:.6f}, correspondences={len(matches_est)}")
+                    else:
+                        print(f"[Umeyama] too few correspondences ({len(matches_est)}), skipping Umeyama (max_match_dt={max_match_dt}s)")
+
+                    est_times_s, est_vel_raw = _compute_vel_central(est_times, est_pos_aligned)
                     gt_times_s, gt_vel = _compute_vel_central(gt_times, gt_pos)
 
-                    # interpolate ground-truth velocities to estimator times (so we can compare directly)
-                    gt_vel_interp = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+                    if est_vel_raw.shape[0] >= 10 and gt_vel.shape[0] >= 10:
+                        try:
+                            gt_on_est = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+                            median_dt = float(np.median(np.diff(est_times_s)))
+                            lag = estimate_time_offset_scalar(est_vel_raw[:, 0], gt_on_est[:, 0], dt=median_dt, max_offset_s=0.5)
+                            if abs(lag) > 1e-6:
+                                est_times_s = est_times_s - lag
+                                est_times = est_times - lag
+                                print(f"[TimeOffset] applied lag={lag:.4f}s")
+                                gt_on_est = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+                            else:
+                                gt_on_est = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+                        except Exception as e:
+                            print("Time-offset estimation failed:", e)
+                            gt_on_est = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+                    else:
+                        gt_on_est = _interp_to_times(gt_times_s, gt_vel, est_times_s)
+
+                    def _rmse(a, b):
+                        return np.sqrt(np.mean((a - b)**2, axis=0))
+                    try:
+                        rmse_raw = _rmse(est_vel_raw, gt_on_est)
+                        print(f"Vel RMSE raw   (vx,vy,vz): {rmse_raw}")
+                    except Exception:
+                        pass
 
                     saved_dir = os.path.join(outfolder, "saved_results", "traj_est")
                     os.makedirs(saved_dir, exist_ok=True)
-                    vel_est_file = os.path.join(saved_dir, "vel_est.txt")
-                    vel_gt_file = os.path.join(saved_dir, "vel_gt_interp.txt")
-                    with open(vel_est_file, "w") as fe:
-                        fe.write("# time[s] vx vy vz  (est)\n")
-                        for t, v in zip(est_times_s, est_vel):
-                            fe.write(f"{t:.9f} {v[0]:.9e} {v[1]:.9e} {v[2]:.9e}\n")
-                    with open(vel_gt_file, "w") as fg:
-                        fg.write("# time[s] vx vy vz  (gt interpolated to est times)\n")
-                        for t, v in zip(est_times_s, gt_vel_interp):
-                            fg.write(f"{t:.9f} {v[0]:.9e} {v[1]:.9e} {v[2]:.9e}\n")
+                    aligned_file = os.path.join(outfolder, "stamped_traj_estimate_pos_aligned.txt")
+                    with open(aligned_file, 'w') as fa:
+                        for t, p in zip(est_times_s, est_pos_aligned):
+                            fa.write(f"{t:.9f} {p[0]:.9e} {p[1]:.9e} {p[2]:.9e} 0 0 0 1\n")
+
+                    fname_raw = os.path.join(saved_dir, "vel_est_raw.txt")
+                    fname_gt = os.path.join(saved_dir, "vel_gt_on_est_times.txt")
+                    with open(fname_raw, "w") as fr, open(fname_gt, "w") as fg:
+                        fr.write("# time[s] vx vy vz\n")
+                        fg.write("# time[s] vx vy vz\n")
+                        for t, vr, vg in zip(est_times_s, est_vel_raw, gt_on_est):
+                            fr.write(f"{t:.9f} {vr[0]:.9e} {vr[2]:.9e}\n")
+                            fg.write(f"{t:.9f} {vg[0]:.9e} {vg[2]:.9e}\n")
 
                     plot_dir = os.path.join(outfolder, "plots")
                     os.makedirs(plot_dir, exist_ok=True)
-                    fig, axs = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
-                    axs[0].plot(est_times_s, est_vel[:,0], label="est vx")
-                    axs[0].plot(est_times_s, gt_vel_interp[:,0], label="gt vx", linestyle="--")
-                    axs[0].set_ylabel("vx [m/s]")
-                    axs[0].legend()
-                    axs[1].plot(est_times_s, est_vel[:,1], label="est vy")
-                    axs[1].plot(est_times_s, gt_vel_interp[:,1], label="gt vy", linestyle="--")
-                    axs[1].set_ylabel("vy [m/s]")
-                    axs[1].legend()
-                    axs[2].plot(est_times_s, est_vel[:,2], label="est vz")
-                    axs[2].plot(est_times_s, gt_vel_interp[:,2], label="gt vz", linestyle="--")
-                    axs[2].set_ylabel("vz [m/s]")
-                    axs[2].set_xlabel("time [s]")
-                    axs[2].legend()
+                    fig, axs = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+                    axs[0].plot(est_times_s - est_times_s[0], gt_on_est[:, 0], label="gt vx", linewidth=1.2)
+                    axs[0].plot(est_times_s - est_times_s[0], est_vel_raw[:, 0], label="est_raw vx", alpha=0.7)
+                    axs[0].set_ylabel("vx [m/s]"); axs[0].legend(); axs[0].grid(True)
+                    axs[1].plot(est_times_s - est_times_s[0], gt_on_est[:, 1], label="gt vy", linewidth=1.2)
+                    axs[1].plot(est_times_s - est_times_s[0], est_vel_raw[:, 1], label="est_raw vy", alpha=0.7)
+                    axs[1].set_ylabel("vy [m/s]"); axs[1].legend(); axs[1].grid(True)
+                    axs[2].plot(est_times_s - est_times_s[0], gt_on_est[:, 2], label="gt vz", linewidth=1.2)
+                    axs[2].plot(est_times_s - est_times_s[0], est_vel_raw[:, 2], label="est_raw vz", alpha=0.7)
+                    axs[2].set_ylabel("vz [m/s]"); axs[2].set_xlabel("time [s]"); axs[2].legend(); axs[2].grid(True)
                     fig.tight_layout()
-                    plot_file = os.path.join(plot_dir, "velocities_est_vs_gt.png")
+                    plot_file = os.path.join(plot_dir, "velocities_est_vs_gt_improved.png")
                     fig.savefig(plot_file, dpi=200)
                     plt.close(fig)
-
+                    print("Saved velocities and improved plot to", outfolder)
                 except Exception as e:
                     print("Warning: failed to compute or save velocities:", e)
 
